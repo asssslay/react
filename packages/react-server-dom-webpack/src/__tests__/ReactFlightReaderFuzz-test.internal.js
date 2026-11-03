@@ -13,6 +13,7 @@
 // Round-trip generated JavaScript values through the Flight server and client.
 // Vary when Promises resolve, modules load, and stream items are produced.
 // Check the results against the source values after each event.
+// The reply host encodes on the client and decodes on the server instead.
 //
 // Set FUZZ_TEST_SEED to replay a run and FLIGHT_FUZZ_CASES to change its size.
 // FLIGHT_FUZZ_SHRINK limits the number of replays used to reduce a failure.
@@ -58,7 +59,7 @@ class FuzzAbortController extends NativeAbortController {
   }
 }
 
-describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
+describe.each(['node', 'edge', 'reply'])('ReactFlightReaderFuzz (%s)', host => {
   let React;
   let ReactServer;
   let ReactDOMServer;
@@ -159,6 +160,10 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
           React,
           ReactServer,
           WebpackMock,
+          createServerReference:
+            host === 'reply'
+              ? ReactServerDOMClient.createServerReference
+              : undefined,
           observeProps(element, props) {
             oracle.observeProps(element, props);
           },
@@ -228,8 +233,9 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
     model = fixture.model,
   ) {
     const reported = [];
-    if (readTiming === 'after-eof') {
-      // Start rendering with all server events already released.
+    if (host === 'reply' || readTiming === 'after-eof') {
+      // Replies buffer writer output before decoding. The last read timing
+      // also starts the Flight renderer with its events already released.
       for (let i = 0; i < events.length; i++) {
         if (!events[i].isClient) {
           releaseEvent(events[i]);
@@ -244,6 +250,11 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
       WebpackMock,
       host,
       model,
+      body:
+        host === 'reply'
+          ? await ReactServerDOMClient.encodeReply(model)
+          : undefined,
+      bufferedReply: host === 'reply' && readTiming === 'after-eof',
       packetSizes,
       yieldBetweenPackets,
       onError(error) {
@@ -416,17 +427,24 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
     jest.resetModules();
     jest.useRealTimers();
     jest.mock('react', () => require('react/react.react-server'));
+    const serverBuild = host === 'reply' ? 'node' : host;
     jest.doMock('react-server-dom-webpack/server', () =>
-      require('react-server-dom-webpack/server.' + host),
+      require('react-server-dom-webpack/server.' + serverBuild),
     );
     WebpackMock = require('./utils/WebpackMock');
-    ReactServerDOMServer = require('react-server-dom-webpack/server.' + host);
+    ReactServerDOMServer = require(
+      'react-server-dom-webpack/server.' + serverBuild,
+    );
     serverConfig = require('react-server/src/ReactFlightServerConfig');
     ReactServer = require('react');
     jest.resetModules();
     __unmockReact();
     React = require('react');
-    ReactServerDOMClient = require('react-server-dom-webpack/client.' + host);
+    // The Edge client's Server Function references retain their metadata
+    // when bound, so encodeReply can serialize them.
+    ReactServerDOMClient = require(
+      'react-server-dom-webpack/client.' + (host === 'reply' ? 'edge' : host),
+    );
     ReactDOMServer = require('react-dom/server.edge');
     ({assertConsoleErrorDev} = require('internal-test-utils'));
     ({assertConsoleLogsCleared} = require('internal-test-utils/consoleMock'));
@@ -447,7 +465,24 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
     ' schedule=' +
     scheduleIndex;
 
-  describe('generated graphs', () => {
+  // A reply cannot carry client references, elements, server components,
+  // Errors or symbols; its loading leaves are Server Functions.
+  const unsupportedReplyOperations = [
+    'aggregate error',
+    'fragment',
+    'host',
+    'symbol',
+    'element',
+    'props',
+    'component',
+    'failing component',
+    'error',
+    'rejected promise',
+    'failing stream',
+  ];
+
+  // Normal graphs stay enabled while the reply fixes catch up.
+  (host === 'reply' ? describe.skip : describe)('generated graphs', () => {
     seeds.forEach(seed => {
       for (let scheduleIndex = 0; scheduleIndex < 2; scheduleIndex++) {
         readTimings.forEach(readTiming => {
@@ -455,7 +490,10 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
           it(formatCaseName('graph', seed, readTiming, scheduleIndex), () =>
             runGraph({
               ...generateGraph(seed, {
-                without: ['undefined', 'colon'],
+                without: (host === 'reply'
+                  ? unsupportedReplyOperations
+                  : []
+                ).concat(['undefined', 'colon']),
               }),
               seed,
               readTiming,
@@ -565,16 +603,19 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
         roots: {entry: 'object', other: 'object'},
       }));
 
-    it('a large binary value written in two places', () =>
-      runGraph({
-        nodes: {
-          binary: {special: 'large binary'},
-          first: {array: ['binary']},
-          second: {object: {again: 'binary'}},
-          stream: {stream: ['first', 'second']},
-        },
-        roots: {entry: 'stream', other: 'stream'},
-      }));
+    (host === 'reply' ? it.skip : it)(
+      'a large binary value written in two places',
+      () =>
+        runGraph({
+          nodes: {
+            binary: {special: 'large binary'},
+            first: {array: ['binary']},
+            second: {object: {again: 'binary'}},
+            stream: {stream: ['first', 'second']},
+          },
+          roots: {entry: 'stream', other: 'stream'},
+        }),
+    );
 
     it.each(['stream', 'bytes', 'iterable'])(
       '%s shared between two collections',
@@ -589,29 +630,39 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
         }),
     );
 
-    it('an iterator reused in later stream items', () =>
-      runGraph({
-        nodes: {
-          value: {value: 'first'},
-          iterator: {iterator: ['value']},
-          first: {object: {iterator: 'iterator'}},
-          second: {object: {iterator: 'iterator'}},
-          stream: {stream: ['first', 'second']},
-        },
-        roots: {entry: 'stream', other: 'stream'},
-      }));
+    (host === 'reply' ? it.skip : it)(
+      'an iterator reused in later stream items',
+      () =>
+        runGraph({
+          nodes: {
+            value: {value: 'first'},
+            iterator: {iterator: ['value']},
+            first: {object: {iterator: 'iterator'}},
+            second: {object: {iterator: 'iterator'}},
+            stream: {stream: ['first', 'second']},
+          },
+          roots: {entry: 'stream', other: 'stream'},
+        }),
+    );
 
-    it('async iterator with cyclic items and a return value', () =>
-      runGraph({
-        nodes: {
-          ready: {module: 'export-0'},
-          item: {array: ['item', 'ready', 'iterator']},
-          iterator: {iterable: ['item', 'item'], returns: 'item', single: true},
-        },
-        roots: {entry: 'iterator', other: 'iterator'},
-      }));
+    (host === 'reply' ? it.skip : it)(
+      'async iterator with cyclic items and a return value',
+      () =>
+        runGraph({
+          nodes: {
+            ready: {module: 'export-0'},
+            item: {array: ['item', 'ready', 'iterator']},
+            iterator: {
+              iterable: ['item', 'item'],
+              returns: 'item',
+              single: true,
+            },
+          },
+          roots: {entry: 'iterator', other: 'iterator'},
+        }),
+    );
 
-    it.each(['stream', 'bytes', 'iterable'])(
+    (host === 'reply' ? it.skip : it).each(['stream', 'bytes'])(
       '%s in repeated stream items',
       type =>
         runGraph({
@@ -624,7 +675,18 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
         }),
     );
 
-    it.each(['stream', 'bytes', 'iterable'])(
+    it.each(['iterable'])('%s in repeated stream items', type =>
+      runGraph({
+        nodes: {
+          inner: {[type]: type === 'bytes' ? 2 : []},
+          item: {array: ['inner']},
+          outer: {stream: ['item', 'item']},
+        },
+        roots: {entry: 'outer', other: 'outer'},
+      }),
+    );
+
+    (host === 'reply' ? it.skip : it).each(['stream', 'bytes'])(
       '%s shared between different stream items',
       type =>
         runGraph({
@@ -643,6 +705,23 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
         }),
     );
 
+    it.each(['iterable'])('%s shared between different stream items', type =>
+      runGraph({
+        nodes: {
+          inner:
+            type === 'bytes'
+              ? {bytes: 2}
+              : type === 'iterable'
+                ? {iterable: [], single: true}
+                : {stream: []},
+          first: {array: ['inner']},
+          second: {object: {again: 'inner'}},
+          outer: {stream: ['first', 'second']},
+        },
+        roots: {entry: 'outer', other: 'outer'},
+      }),
+    );
+
     it('an async iterable returns a cycle that was already sent', () =>
       runGraph({
         nodes: {
@@ -653,16 +732,17 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
         roots: {entry: 'array', other: 'array'},
       }));
 
-    it('Set containing itself', () =>
+    (host === 'reply' ? it.skip : it)('Set containing itself', () =>
       runGraph({
         nodes: {
           ready: {module: 'export-0'},
           set: {set: ['set', 'ready']},
         },
         roots: {entry: 'set', other: 'set'},
-      }));
+      }),
+    );
 
-    it('Map containing itself', () =>
+    (host === 'reply' ? it.skip : it)('Map containing itself', () =>
       runGraph({
         nodes: {
           ready: {module: 'export-0'},
@@ -675,20 +755,24 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
           },
         },
         roots: {entry: 'map', other: 'map'},
-      }));
+      }),
+    );
 
-    it('two collections containing each other', () =>
-      runGraph({
-        nodes: {
-          ready: {module: 'export-0'},
-          key: {value: 'a'},
-          a: {set: ['b', 'ready']},
-          b: {map: [['key', 'a']]},
-        },
-        roots: {entry: 'a', other: 'b'},
-      }));
+    (host === 'reply' ? it.skip : it)(
+      'two collections containing each other',
+      () =>
+        runGraph({
+          nodes: {
+            ready: {module: 'export-0'},
+            key: {value: 'a'},
+            a: {set: ['b', 'ready']},
+            b: {map: [['key', 'a']]},
+          },
+          roots: {entry: 'a', other: 'b'},
+        }),
+    );
 
-    it('function bound to its array', () =>
+    (host === 'reply' ? it.skip : it)('function bound to its array', () =>
       runGraph({
         nodes: {
           ready: {module: 'export-0'},
@@ -696,9 +780,10 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
           container: {array: ['fn', 'container', 'ready']},
         },
         roots: {entry: 'container', other: 'container'},
-      }));
+      }),
+    );
 
-    it('function bound to its Map', () =>
+    (host === 'reply' ? it.skip : it)('function bound to its Map', () =>
       runGraph({
         nodes: {
           ready: {module: 'export-0'},
@@ -711,40 +796,50 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
           },
         },
         roots: {entry: 'container', other: 'container'},
-      }));
+      }),
+    );
 
-    it('cycle first exposed through a bound function', () =>
-      runGraph({
-        nodes: {
-          ready: {module: 'export-0'},
-          fn: {bound: ['region']},
-          region: {set: ['fn', 'region', 'ready']},
-        },
-        roots: {entry: 'fn', other: 'fn'},
-      }));
+    (host === 'reply' ? it.skip : it)(
+      'cycle first exposed through a bound function',
+      () =>
+        runGraph({
+          nodes: {
+            ready: {module: 'export-0'},
+            fn: {bound: ['region']},
+            region: {set: ['fn', 'region', 'ready']},
+          },
+          roots: {entry: 'fn', other: 'fn'},
+        }),
+    );
 
-    it('cycle first exposed through a Promise of a bound function', () =>
-      runGraph({
-        nodes: {
-          ready: {module: 'export-0'},
-          fn: {bound: ['region']},
-          region: {object: {field0: 'fn', field1: 'region', field2: 'ready'}},
-          exposure: {promise: 'fn'},
-        },
-        roots: {entry: 'exposure', other: 'exposure'},
-      }));
+    (host === 'reply' ? it.skip : it)(
+      'cycle first exposed through a Promise of a bound function',
+      () =>
+        runGraph({
+          nodes: {
+            ready: {module: 'export-0'},
+            fn: {bound: ['region']},
+            region: {object: {field0: 'fn', field1: 'region', field2: 'ready'}},
+            exposure: {promise: 'fn'},
+          },
+          roots: {entry: 'exposure', other: 'exposure'},
+        }),
+    );
 
-    it('cycle first exposed through a stream item with a bound function', () =>
-      runGraph({
-        nodes: {
-          ready: {module: 'export-0'},
-          fn: {bound: ['region']},
-          region: {array: ['fn', 'region', 'ready']},
-          item: {array: ['fn']},
-          exposure: {stream: ['item']},
-        },
-        roots: {entry: 'exposure', other: 'exposure'},
-      }));
+    (host === 'reply' ? it.skip : it)(
+      'cycle first exposed through a stream item with a bound function',
+      () =>
+        runGraph({
+          nodes: {
+            ready: {module: 'export-0'},
+            fn: {bound: ['region']},
+            region: {array: ['fn', 'region', 'ready']},
+            item: {array: ['fn']},
+            exposure: {stream: ['item']},
+          },
+          roots: {entry: 'exposure', other: 'exposure'},
+        }),
+    );
 
     it('async module failing to evaluate after loading', () =>
       runGraph({
@@ -769,16 +864,17 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
         afterEof: true,
       }));
 
-    it('streamed array containing itself', () =>
+    (host === 'reply' ? it.skip : it)('streamed array containing itself', () =>
       runGraph({
         nodes: {
           item: {array: ['item']},
           stream: {stream: ['item']},
         },
         roots: {entry: 'stream', other: 'stream'},
-      }));
+      }),
+    );
 
-    it('stream item with a failing module', () =>
+    (host === 'reply' ? it.skip : it)('stream item with a failing module', () =>
       runGraph({
         nodes: {
           broken: {module: 'export-0', fail: 'load'},
@@ -786,7 +882,8 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
           stream: {stream: ['item']},
         },
         roots: {entry: 'stream', other: 'stream'},
-      }));
+      }),
+    );
 
     it('byte stream read with a BYOB reader', () =>
       runGraph({
@@ -853,20 +950,23 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
       }));
 
     // Include enough values for the FormData reference ID to contain a hex letter.
-    it('FormData bound to a function in a larger graph', () =>
-      runGraph({
-        nodes: {
-          form: {special: 'form data'},
-          set: {set: ['bytes', 'map', 'fn']},
-          outerMap: {map: [['set', 'iterable']]},
-          bytes: {bytes: 3},
-          map: {map: []},
-          fn: {bound: ['form']},
-          iterable: {iterable: []},
-        },
-        roots: {entry: 'map', other: 'outerMap'},
-        rootPromise: true,
-      }));
+    (host === 'reply' ? it.skip : it)(
+      'FormData bound to a function in a larger graph',
+      () =>
+        runGraph({
+          nodes: {
+            form: {special: 'form data'},
+            set: {set: ['bytes', 'map', 'fn']},
+            outerMap: {map: [['set', 'iterable']]},
+            bytes: {bytes: 3},
+            map: {map: []},
+            fn: {bound: ['form']},
+            iterable: {iterable: []},
+          },
+          roots: {entry: 'map', other: 'outerMap'},
+          rootPromise: true,
+        }),
+    );
 
     it('iterator over values still loading', () =>
       runGraph({
@@ -900,357 +1000,360 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
       }));
   });
 
-  describe('known cases with elements, components or Errors', () => {
-    it('a Promise resolves before another value containing it finishes loading', () =>
-      runGraph({
-        nodes: {
-          value: {value: null},
-          data: {promise: 'value'},
-          ready: {module: 'loaded'},
-          section: {object: {data: 'data', ready: 'ready'}},
-          later: {promise: 'section'},
-          root: {object: {data: 'data', section: 'later'}},
-        },
-        roots: {entry: 'root', other: 'root'},
-        events: [
-          'resolve later to section',
-          'resolve data to value',
-          'load ready',
-        ],
-      }));
-
-    it.each([
-      ['stream', null],
-      ['stream', 'keyed'],
-      ['iterable', null],
-    ])(
-      'a shared %s first returned through element context with key %s',
-      async (type, key) => {
-        await withFlightModules(async () => {
-          const fixture = await createFixture(
-            {
-              nodes: {
-                a: {value: 'a'},
-                b: {value: 'b'},
-                shared:
-                  type === 'stream'
-                    ? {stream: ['a', 'b']}
-                    : {iterable: ['a', 'b'], single: true},
-              },
-              roots: {entry: 'shared', other: 'shared'},
-            },
-            {React, ReactServer, WebpackMock},
-          );
-          const shared = fixture.model.entry;
-          function Body() {
-            return shared;
-          }
-          // Return the stream through an element first, then as an object property.
-          const first =
-            type === 'stream'
-              ? ReactServer.createElement(Body, {key})
-              : ReactServer.createElement(ReactServer.Fragment, null, shared);
-          const oracle = createOracle(fixture, {render});
-          await checkResponse(
-            fixture,
-            oracle,
-            {
-              readTiming: 'early',
-              events: fixture.events,
-              packetSizes: [1, 21, 4096],
-              yieldBetweenPackets: true,
-            },
-            {...fixture.model, entry: first},
-          );
-        });
-      },
-    );
-
-    it('an element first written inside another loading value', () =>
-      runGraph({
-        nodes: {
-          element: {host: 'atom'},
-          ready: {module: 'loaded'},
-          array: {array: ['element', 'ready']},
-          first: {promise: 'array'},
-          second: {promise: 'element'},
-          root: {array: ['first', 'second']},
-        },
-        roots: {entry: 'root', other: 'root'},
-        events: [
-          'resolve first to array',
-          'resolve second to element',
-          'load ready',
-        ],
-      }));
-
-    it('a Fragment first received inside a stream item', () =>
-      runGraph({
-        nodes: {
-          fragment: {fragment: []},
-          item: {array: ['fragment']},
-          stream: {stream: ['item']},
-        },
-        roots: {entry: 'stream', other: 'stream'},
-      }));
-
-    it('an Error that is its own cause', () =>
-      runGraph({
-        nodes: {error: {error: 'self cause', cause: 'error'}},
-        roots: {entry: 'error', other: 'error'},
-      }));
-    // The function and its bound container refer to each other. Both
-    // Promises must resolve with complete values once the module loads.
-    it('a repeated Server Function bound to its loading container', () =>
-      runGraph({
-        nodes: {
-          ready: {module: 'loaded'},
-          argument: {object: {value: 'ready', fn: 'fn'}},
-          fn: {bound: ['argument']},
-          first: {promise: 'argument'},
-          result: {promise: 'fn'},
-        },
-        roots: {entry: 'first', other: 'result'},
-        events: [
-          'load fn',
-          'resolve first to argument',
-          'resolve result to fn',
-          'load ready',
-        ],
-        packetSizes: [1, 25, 2091],
-        yieldBetweenPackets: true,
-      }));
-
-    it('props object referenced again while a prop is loading', () =>
-      runGraph({
-        nodes: {
-          payload: {module: 'export-0'},
-          data: {object: {field0: 'props'}},
-          value: {array: ['payload', 'data']},
-          element: {element: 'value'},
-          props: {props: 'element'},
-        },
-        roots: {entry: 'element', other: 'props'},
-      }));
-
-    it('props sub-object referenced while a sibling prop is loading', () =>
-      runGraph({
-        nodes: {
-          payload: {module: 'export-0'},
-          sibling: {module: 'export-1'},
-          selected: {object: {field0: 'payload'}},
-          value: {array: ['selected', 'sibling']},
-          element: {element: 'value'},
-        },
-        roots: {entry: 'element', other: 'selected'},
-      }));
-
-    it('element reaching itself through its props', () =>
-      runGraph({
-        nodes: {
-          payload: {module: 'export-0'},
-          data: {object: {field0: 'element'}},
-          value: {array: ['payload', 'data']},
-          element: {element: 'value'},
-        },
-        roots: {entry: 'element', other: 'data'},
-      }));
-
-    it('a cyclic Map with values that load independently', () =>
-      runGraph({
-        nodes: {
-          value1: {value: 'other value'},
-          value2: {value: ''},
-          value3: {value: 42},
-          text0: {text: 'text-898'},
-          blob0: {blob: 'blob-116'},
-          host0: {host: 'atom'},
-          module1: {module: 'export-1', async: true},
-          array0: {array: ['array0']},
-          set0: {set: ['map1']},
-          map0: {
-            map: [
-              ['blob0', 'bytes0'],
-              ['value3', 'props0'],
-              ['module1', 'iterable0'],
-              ['set0', 'value2'],
-              ['array0', 'value1'],
-            ],
-          },
-          map1: {
-            map: [
-              ['host0', 'host0'],
-              ['element0', 'host0'],
-              ['array0', 'host0'],
-              ['blob0', 'text0'],
-            ],
-          },
-          bytes0: {bytes: 2},
-          element0: {element: 'host0'},
-          props0: {props: 'element0'},
-          iterable0: {iterable: []},
-        },
-        roots: {entry: 'map0', other: 'array0'},
-        afterEof: true,
-        rootPromise: true,
-        events: [
-          'bytes0 chunk 1',
-          'load module1',
-          'bytes0 chunk 0',
-          'return iterable0',
-          'load element0',
-          'evaluate module1',
-          'resolve the root Promise',
-          'resolve an unrelated Promise',
-        ],
-        packetSizes: [3, 89, 2624],
-        yieldBetweenPackets: false,
-        readTiming: 'early',
-      }));
-
-    it('built-in values with a cycle and a loading module', () =>
-      runGraph({
-        nodes: {
-          ready: {module: 'export-0'},
-          nothing: {value: null},
-          flag: {value: true},
-          bigint: {special: 'bigint'},
-          nan: {special: 'nan'},
-          negativeZero: {special: 'negative zero'},
-          infinity: {special: 'infinity'},
-          symbol: {special: 'symbol'},
-          escaped: {special: 'escaped'},
-          text: {text: 'text'},
-          date: {date: 1700000000000},
-          buffer: {special: 'buffer'},
-          binary: {binary: 3},
-          typed: {special: 'typed array'},
-          view: {special: 'data view'},
-          bigints: {special: 'bigint array'},
-          blob: {blob: 'blob'},
-          form: {special: 'form data'},
-          host: {host: 'atom'},
-          atoms: {
-            array: [
-              'nothing',
-              'flag',
-              'bigint',
-              'nan',
-              'negativeZero',
-              'infinity',
-              'symbol',
-              'escaped',
-              'text',
-              'date',
-              'buffer',
-              'binary',
-              'typed',
-              'view',
-              'bigints',
-              'blob',
-              'form',
-              'host',
-              'ready',
-              'cycle',
-            ],
-          },
-          cycle: {object: {field0: 'atoms', field1: 'cycle'}},
-        },
-        roots: {entry: 'cycle', other: 'cycle'},
-      }));
-
-    it('server component rendering after the rest of the response', () =>
-      runGraph({
-        nodes: {
-          ready: {module: 'export-0'},
-          body: {value: 'body'},
-          component: {component: 'body'},
-          data: {object: {field0: 'ready'}},
-        },
-        roots: {entry: 'component', other: 'data'},
-      }));
-
-    it('failing server component', () =>
-      runGraph({
-        nodes: {
-          ready: {module: 'export-0'},
-          error: {error: 'component failed'},
-          component: {component: 'error', throw: true},
-          data: {object: {field0: 'ready'}},
-        },
-        roots: {entry: 'component', other: 'data'},
-      }));
-
-    it('suspended server component element used twice', () =>
-      runGraph({
-        nodes: {
-          body: {value: 'shared'},
-          component: {component: 'body'},
-          pair: {array: ['component', 'component']},
-        },
-        roots: {entry: 'pair', other: 'pair'},
-      }));
-
-    it('server error through a rejected Promise', () =>
-      runGraph({
-        nodes: {
-          ready: {module: 'export-0'},
-          error: {error: 'expected failure'},
-          failing: {promise: 'error', reject: true},
-          fine: {object: {field0: 'ready'}},
-        },
-        roots: {entry: 'failing', other: 'fine'},
-      }));
-
-    it('source stream failure while another value is still loading', () =>
-      runGraph({
-        nodes: {
-          error: {error: 'stream failed'},
-          stream: {stream: [], fail: 'error'},
-          ready: {module: 'loaded'},
-          object: {object: {ready: 'ready'}},
-          later: {promise: 'object'},
-        },
-        roots: {entry: 'stream', other: 'later'},
-        events: ['resolve later to object', 'fail stream', 'load ready'],
-      }));
-
-    it.each(['cause', 'errors'])(
-      'failing stream reachable only through Error.%s',
-      property =>
+  // These value types are only supported in server-to-client responses.
+  if (host !== 'reply') {
+    describe('known cases with elements, components or Errors', () => {
+      it('a Promise resolves before another value containing it finishes loading', () =>
         runGraph({
           nodes: {
-            failure: {error: 'stream failed'},
-            stream: {stream: [], fail: 'failure'},
-            error: {
-              error: 'outer',
-              [property]: property === 'cause' ? 'stream' : ['stream'],
-            },
+            value: {value: null},
+            data: {promise: 'value'},
+            ready: {module: 'loaded'},
+            section: {object: {data: 'data', ready: 'ready'}},
+            later: {promise: 'section'},
+            root: {object: {data: 'data', section: 'later'}},
           },
+          roots: {entry: 'root', other: 'root'},
+          events: [
+            'resolve later to section',
+            'resolve data to value',
+            'load ready',
+          ],
+        }));
+
+      it.each([
+        ['stream', null],
+        ['stream', 'keyed'],
+        ['iterable', null],
+      ])(
+        'a shared %s first returned through element context with key %s',
+        async (type, key) => {
+          await withFlightModules(async () => {
+            const fixture = await createFixture(
+              {
+                nodes: {
+                  a: {value: 'a'},
+                  b: {value: 'b'},
+                  shared:
+                    type === 'stream'
+                      ? {stream: ['a', 'b']}
+                      : {iterable: ['a', 'b'], single: true},
+                },
+                roots: {entry: 'shared', other: 'shared'},
+              },
+              {React, ReactServer, WebpackMock},
+            );
+            const shared = fixture.model.entry;
+            function Body() {
+              return shared;
+            }
+            // Return the stream through an element first, then as an object property.
+            const first =
+              type === 'stream'
+                ? ReactServer.createElement(Body, {key})
+                : ReactServer.createElement(ReactServer.Fragment, null, shared);
+            const oracle = createOracle(fixture, {render});
+            await checkResponse(
+              fixture,
+              oracle,
+              {
+                readTiming: 'early',
+                events: fixture.events,
+                packetSizes: [1, 21, 4096],
+                yieldBetweenPackets: true,
+              },
+              {...fixture.model, entry: first},
+            );
+          });
+        },
+      );
+
+      it('an element first written inside another loading value', () =>
+        runGraph({
+          nodes: {
+            element: {host: 'atom'},
+            ready: {module: 'loaded'},
+            array: {array: ['element', 'ready']},
+            first: {promise: 'array'},
+            second: {promise: 'element'},
+            root: {array: ['first', 'second']},
+          },
+          roots: {entry: 'root', other: 'root'},
+          events: [
+            'resolve first to array',
+            'resolve second to element',
+            'load ready',
+          ],
+        }));
+
+      it('a Fragment first received inside a stream item', () =>
+        runGraph({
+          nodes: {
+            fragment: {fragment: []},
+            item: {array: ['fragment']},
+            stream: {stream: ['item']},
+          },
+          roots: {entry: 'stream', other: 'stream'},
+        }));
+
+      it('an Error that is its own cause', () =>
+        runGraph({
+          nodes: {error: {error: 'self cause', cause: 'error'}},
           roots: {entry: 'error', other: 'error'},
-        }),
-    );
+        }));
+      // The function and its bound container refer to each other. Both
+      // Promises must resolve with complete values once the module loads.
+      it('a repeated Server Function bound to its loading container', () =>
+        runGraph({
+          nodes: {
+            ready: {module: 'loaded'},
+            argument: {object: {value: 'ready', fn: 'fn'}},
+            fn: {bound: ['argument']},
+            first: {promise: 'argument'},
+            result: {promise: 'fn'},
+          },
+          roots: {entry: 'first', other: 'result'},
+          events: [
+            'load fn',
+            'resolve first to argument',
+            'resolve result to fn',
+            'load ready',
+          ],
+          packetSizes: [1, 25, 2091],
+          yieldBetweenPackets: true,
+        }));
 
-    it('Error whose cause is still loading', () =>
-      runGraph({
-        nodes: {
-          ready: {module: 'export-0'},
-          error: {error: 'cause loading', cause: 'ready'},
-          set: {set: ['error']},
-        },
-        roots: {entry: 'set', other: 'set'},
-      }));
+      it('props object referenced again while a prop is loading', () =>
+        runGraph({
+          nodes: {
+            payload: {module: 'export-0'},
+            data: {object: {field0: 'props'}},
+            value: {array: ['payload', 'data']},
+            element: {element: 'value'},
+            props: {props: 'element'},
+          },
+          roots: {entry: 'element', other: 'props'},
+        }));
 
-    it('Error with cyclic cause', () =>
-      runGraph({
-        nodes: {
-          ready: {module: 'export-0'},
-          cell: {object: {field0: 'ready', field1: 'error'}},
-          error: {error: 'cyclic cause', cause: 'cell'},
-        },
-        roots: {entry: 'error', other: 'cell'},
-      }));
-  });
+      it('props sub-object referenced while a sibling prop is loading', () =>
+        runGraph({
+          nodes: {
+            payload: {module: 'export-0'},
+            sibling: {module: 'export-1'},
+            selected: {object: {field0: 'payload'}},
+            value: {array: ['selected', 'sibling']},
+            element: {element: 'value'},
+          },
+          roots: {entry: 'element', other: 'selected'},
+        }));
+
+      it('element reaching itself through its props', () =>
+        runGraph({
+          nodes: {
+            payload: {module: 'export-0'},
+            data: {object: {field0: 'element'}},
+            value: {array: ['payload', 'data']},
+            element: {element: 'value'},
+          },
+          roots: {entry: 'element', other: 'data'},
+        }));
+
+      it('a cyclic Map with values that load independently', () =>
+        runGraph({
+          nodes: {
+            value1: {value: 'other value'},
+            value2: {value: ''},
+            value3: {value: 42},
+            text0: {text: 'text-898'},
+            blob0: {blob: 'blob-116'},
+            host0: {host: 'atom'},
+            module1: {module: 'export-1', async: true},
+            array0: {array: ['array0']},
+            set0: {set: ['map1']},
+            map0: {
+              map: [
+                ['blob0', 'bytes0'],
+                ['value3', 'props0'],
+                ['module1', 'iterable0'],
+                ['set0', 'value2'],
+                ['array0', 'value1'],
+              ],
+            },
+            map1: {
+              map: [
+                ['host0', 'host0'],
+                ['element0', 'host0'],
+                ['array0', 'host0'],
+                ['blob0', 'text0'],
+              ],
+            },
+            bytes0: {bytes: 2},
+            element0: {element: 'host0'},
+            props0: {props: 'element0'},
+            iterable0: {iterable: []},
+          },
+          roots: {entry: 'map0', other: 'array0'},
+          afterEof: true,
+          rootPromise: true,
+          events: [
+            'bytes0 chunk 1',
+            'load module1',
+            'bytes0 chunk 0',
+            'return iterable0',
+            'load element0',
+            'evaluate module1',
+            'resolve the root Promise',
+            'resolve an unrelated Promise',
+          ],
+          packetSizes: [3, 89, 2624],
+          yieldBetweenPackets: false,
+          readTiming: 'early',
+        }));
+
+      it('built-in values with a cycle and a loading module', () =>
+        runGraph({
+          nodes: {
+            ready: {module: 'export-0'},
+            nothing: {value: null},
+            flag: {value: true},
+            bigint: {special: 'bigint'},
+            nan: {special: 'nan'},
+            negativeZero: {special: 'negative zero'},
+            infinity: {special: 'infinity'},
+            symbol: {special: 'symbol'},
+            escaped: {special: 'escaped'},
+            text: {text: 'text'},
+            date: {date: 1700000000000},
+            buffer: {special: 'buffer'},
+            binary: {binary: 3},
+            typed: {special: 'typed array'},
+            view: {special: 'data view'},
+            bigints: {special: 'bigint array'},
+            blob: {blob: 'blob'},
+            form: {special: 'form data'},
+            host: {host: 'atom'},
+            atoms: {
+              array: [
+                'nothing',
+                'flag',
+                'bigint',
+                'nan',
+                'negativeZero',
+                'infinity',
+                'symbol',
+                'escaped',
+                'text',
+                'date',
+                'buffer',
+                'binary',
+                'typed',
+                'view',
+                'bigints',
+                'blob',
+                'form',
+                'host',
+                'ready',
+                'cycle',
+              ],
+            },
+            cycle: {object: {field0: 'atoms', field1: 'cycle'}},
+          },
+          roots: {entry: 'cycle', other: 'cycle'},
+        }));
+
+      it('server component rendering after the rest of the response', () =>
+        runGraph({
+          nodes: {
+            ready: {module: 'export-0'},
+            body: {value: 'body'},
+            component: {component: 'body'},
+            data: {object: {field0: 'ready'}},
+          },
+          roots: {entry: 'component', other: 'data'},
+        }));
+
+      it('failing server component', () =>
+        runGraph({
+          nodes: {
+            ready: {module: 'export-0'},
+            error: {error: 'component failed'},
+            component: {component: 'error', throw: true},
+            data: {object: {field0: 'ready'}},
+          },
+          roots: {entry: 'component', other: 'data'},
+        }));
+
+      it('suspended server component element used twice', () =>
+        runGraph({
+          nodes: {
+            body: {value: 'shared'},
+            component: {component: 'body'},
+            pair: {array: ['component', 'component']},
+          },
+          roots: {entry: 'pair', other: 'pair'},
+        }));
+
+      it('server error through a rejected Promise', () =>
+        runGraph({
+          nodes: {
+            ready: {module: 'export-0'},
+            error: {error: 'expected failure'},
+            failing: {promise: 'error', reject: true},
+            fine: {object: {field0: 'ready'}},
+          },
+          roots: {entry: 'failing', other: 'fine'},
+        }));
+
+      it('source stream failure while another value is still loading', () =>
+        runGraph({
+          nodes: {
+            error: {error: 'stream failed'},
+            stream: {stream: [], fail: 'error'},
+            ready: {module: 'loaded'},
+            object: {object: {ready: 'ready'}},
+            later: {promise: 'object'},
+          },
+          roots: {entry: 'stream', other: 'later'},
+          events: ['resolve later to object', 'fail stream', 'load ready'],
+        }));
+
+      it.each(['cause', 'errors'])(
+        'failing stream reachable only through Error.%s',
+        property =>
+          runGraph({
+            nodes: {
+              failure: {error: 'stream failed'},
+              stream: {stream: [], fail: 'failure'},
+              error: {
+                error: 'outer',
+                [property]: property === 'cause' ? 'stream' : ['stream'],
+              },
+            },
+            roots: {entry: 'error', other: 'error'},
+          }),
+      );
+
+      it('Error whose cause is still loading', () =>
+        runGraph({
+          nodes: {
+            ready: {module: 'export-0'},
+            error: {error: 'cause loading', cause: 'ready'},
+            set: {set: ['error']},
+          },
+          roots: {entry: 'set', other: 'set'},
+        }));
+
+      it('Error with cyclic cause', () =>
+        runGraph({
+          nodes: {
+            ready: {module: 'export-0'},
+            cell: {object: {field0: 'ready', field1: 'error'}},
+            error: {error: 'cyclic cause', cause: 'cell'},
+          },
+          roots: {entry: 'error', other: 'cell'},
+        }));
+    });
+  }
 });
 
 const MAX_FLUSH_ATTEMPTS = 30;
@@ -1261,6 +1364,8 @@ function startFlightResponse({
   WebpackMock,
   host,
   model,
+  body,
+  bufferedReply,
   packetSizes,
   yieldBetweenPackets,
   onError,
@@ -1294,7 +1399,65 @@ function startFlightResponse({
       }
     },
   };
-  if (host === 'node') {
+  if (host === 'reply') {
+    serverDone = true;
+    serverCompletion = Promise.resolve();
+    abort = () => {};
+    // The graph size is bounded by the generator. Test decoding independently
+    // of the application's configurable limit on nested arrays.
+    const replyOptions = {arraySizeLimit: Infinity};
+    if (bufferedReply) {
+      root = ReactServerDOMServer.decodeReply(
+        body,
+        WebpackMock.webpackServerMap,
+        replyOptions,
+      );
+      send = () => {};
+      end = () => {};
+    } else {
+      // Packet sizes count FormData entries, since the public decoder reads
+      // entries from an async iterable rather than bytes from a stream.
+      queued =
+        typeof body === 'string' ? [['0', body]] : Array.from(body.entries());
+      const waiting = [];
+      const arrived = [];
+      let ended = false;
+      const deliver = () => {
+        while (waiting.length && (arrived.length || ended)) {
+          waiting.shift()(
+            arrived.length
+              ? {done: false, value: arrived.shift()}
+              : {done: true, value: undefined},
+          );
+        }
+      };
+      const entries = {
+        [Symbol.asyncIterator]() {
+          return {
+            next() {
+              return new Promise(resolve => {
+                waiting.push(resolve);
+                deliver();
+              });
+            },
+          };
+        },
+      };
+      root = ReactServerDOMServer.decodeReplyFromAsyncIterable(
+        entries,
+        WebpackMock.webpackServerMap,
+        replyOptions,
+      );
+      send = entry => {
+        arrived.push(entry);
+        deliver();
+      };
+      end = () => {
+        ended = true;
+        deliver();
+      };
+    }
+  } else if (host === 'node') {
     const {PassThrough, Writable} = require('stream');
     const {finished} = require('stream/promises');
     const input = new PassThrough();
@@ -1361,18 +1524,27 @@ function startFlightResponse({
   // Split output into uneven packets to exercise partial reads.
   async function flush() {
     await tick();
-
-    // A broken byte-stream reader may transfer the packet's buffer. Give
-    // the transport its own buffer so this can fail the case without also
-    // detaching Node's shared Buffer pool and breaking Jest's file reads.
-    const bytes = new Uint8Array(Buffer.concat(queued));
-    queued = [];
-    for (let offset = 0; offset < bytes.length; ) {
-      const size = packetSizes[packet++ % packetSizes.length];
-      send(bytes.subarray(offset, offset + size));
-      offset += size;
-      if (yieldBetweenPackets) {
-        await tick();
+    if (host === 'reply') {
+      while (queued.length) {
+        const count = packetSizes[packet++ % packetSizes.length];
+        queued.splice(0, count).forEach(send);
+        if (yieldBetweenPackets) {
+          await tick();
+        }
+      }
+    } else {
+      // A broken byte-stream reader may transfer the packet's buffer. Give
+      // the transport its own buffer so this can fail the case without also
+      // detaching Node's shared Buffer pool and breaking Jest's file reads.
+      const bytes = new Uint8Array(Buffer.concat(queued));
+      queued = [];
+      for (let offset = 0; offset < bytes.length; ) {
+        const size = packetSizes[packet++ % packetSizes.length];
+        send(bytes.subarray(offset, offset + size));
+        offset += size;
+        if (yieldBetweenPackets) {
+          await tick();
+        }
       }
     }
 
