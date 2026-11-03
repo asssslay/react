@@ -630,39 +630,33 @@ describe.each(['node', 'edge', 'reply'])('ReactFlightReaderFuzz (%s)', host => {
         }),
     );
 
-    (host === 'reply' ? it.skip : it)(
-      'an iterator reused in later stream items',
-      () =>
-        runGraph({
-          nodes: {
-            value: {value: 'first'},
-            iterator: {iterator: ['value']},
-            first: {object: {iterator: 'iterator'}},
-            second: {object: {iterator: 'iterator'}},
-            stream: {stream: ['first', 'second']},
-          },
-          roots: {entry: 'stream', other: 'stream'},
-        }),
-    );
+    it('an iterator reused in later stream items', () =>
+      runGraph({
+        nodes: {
+          value: {value: 'first'},
+          iterator: {iterator: ['value']},
+          first: {object: {iterator: 'iterator'}},
+          second: {object: {iterator: 'iterator'}},
+          stream: {stream: ['first', 'second']},
+        },
+        roots: {entry: 'stream', other: 'stream'},
+      }));
 
-    (host === 'reply' ? it.skip : it)(
-      'async iterator with cyclic items and a return value',
-      () =>
-        runGraph({
-          nodes: {
-            ready: {module: 'export-0'},
-            item: {array: ['item', 'ready', 'iterator']},
-            iterator: {
-              iterable: ['item', 'item'],
-              returns: 'item',
-              single: true,
-            },
+    it('async iterator with cyclic items and a return value', () =>
+      runGraph({
+        nodes: {
+          ready: {module: 'export-0'},
+          item: {array: ['item', 'ready', 'iterator']},
+          iterator: {
+            iterable: ['item', 'item'],
+            returns: 'item',
+            single: true,
           },
-          roots: {entry: 'iterator', other: 'iterator'},
-        }),
-    );
+        },
+        roots: {entry: 'iterator', other: 'iterator'},
+      }));
 
-    (host === 'reply' ? it.skip : it).each(['stream', 'bytes'])(
+    it.each(['stream', 'bytes', 'iterable'])(
       '%s in repeated stream items',
       type =>
         runGraph({
@@ -675,18 +669,7 @@ describe.each(['node', 'edge', 'reply'])('ReactFlightReaderFuzz (%s)', host => {
         }),
     );
 
-    it.each(['iterable'])('%s in repeated stream items', type =>
-      runGraph({
-        nodes: {
-          inner: {[type]: type === 'bytes' ? 2 : []},
-          item: {array: ['inner']},
-          outer: {stream: ['item', 'item']},
-        },
-        roots: {entry: 'outer', other: 'outer'},
-      }),
-    );
-
-    (host === 'reply' ? it.skip : it).each(['stream', 'bytes'])(
+    it.each(['stream', 'bytes', 'iterable'])(
       '%s shared between different stream items',
       type =>
         runGraph({
@@ -703,23 +686,6 @@ describe.each(['node', 'edge', 'reply'])('ReactFlightReaderFuzz (%s)', host => {
           },
           roots: {entry: 'outer', other: 'outer'},
         }),
-    );
-
-    it.each(['iterable'])('%s shared between different stream items', type =>
-      runGraph({
-        nodes: {
-          inner:
-            type === 'bytes'
-              ? {bytes: 2}
-              : type === 'iterable'
-                ? {iterable: [], single: true}
-                : {stream: []},
-          first: {array: ['inner']},
-          second: {object: {again: 'inner'}},
-          outer: {stream: ['first', 'second']},
-        },
-        roots: {entry: 'outer', other: 'outer'},
-      }),
     );
 
     it('an async iterable returns a cycle that was already sent', () =>
@@ -864,15 +830,14 @@ describe.each(['node', 'edge', 'reply'])('ReactFlightReaderFuzz (%s)', host => {
         afterEof: true,
       }));
 
-    (host === 'reply' ? it.skip : it)('streamed array containing itself', () =>
+    it('streamed array containing itself', () =>
       runGraph({
         nodes: {
           item: {array: ['item']},
           stream: {stream: ['item']},
         },
         roots: {entry: 'stream', other: 'stream'},
-      }),
-    );
+      }));
 
     (host === 'reply' ? it.skip : it)('stream item with a failing module', () =>
       runGraph({

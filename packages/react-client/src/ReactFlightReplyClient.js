@@ -198,6 +198,12 @@ function escapeStringValue(value: string): string {
 
 interface Reference {}
 
+type StreamItemContext = {
+  parent: null | StreamItemContext,
+  referenced: boolean,
+  objects: Set<Reference>,
+};
+
 export function processReply(
   root: ReactServerValue,
   formFieldPrefix: string,
@@ -342,9 +348,7 @@ export function processReply(
         }
       } else {
         try {
-          // $FlowFixMe[incompatible-type]: While plain JSON can return undefined we never do here.
-          const partJSON: string = JSON.stringify(entry.value, resolveToJSON);
-          data.append(streamPrefix, partJSON);
+          data.append(streamPrefix, serializeStreamItem(entry.value));
           reader.read().then(progress, reject);
         } catch (x) {
           reject(x);
@@ -354,6 +358,63 @@ export function processReply(
     reader.read().then(progress, reject);
 
     return '$R' + streamId.toString(16);
+  }
+
+  // A stream item is written straight into its stream's part and has no id
+  // of its own, so it is given one before it is written, in case it or
+  // anything below it comes up a second time. The id becomes a part of its
+  // own only when something referred to the item or to a path under it;
+  // otherwise those references are dropped again, since no part will ever
+  // be written for them.
+  let streamItemContext: null | StreamItemContext = null;
+
+  function serializeStreamItem(value: ReactServerValue): string {
+    if (
+      typeof value !== 'object' ||
+      value === null ||
+      writtenObjects.has(value)
+    ) {
+      // $FlowFixMe[incompatible-type]: While plain JSON can return undefined we never do here.
+      const partJSON: string = JSON.stringify(value, resolveToJSON);
+      return partJSON;
+    }
+    const id = nextPartId++;
+    const reference = serializeByValueID(id);
+    const previousModelRoot = modelRoot;
+    const context: StreamItemContext = {
+      parent: streamItemContext,
+      referenced: false,
+      objects: new Set([value]),
+    };
+    writtenObjects.set(value, reference);
+    streamItemContext = context;
+    modelRoot = value;
+    try {
+      // $FlowFixMe[incompatible-type]: While plain JSON can return undefined we never do here.
+      const partJSON: string = JSON.stringify(value, resolveToJSON);
+      if (!context.referenced) {
+        // The item is written inline after all. A value that got a part of
+        // its own in the meantime, like a stream, keeps that reference.
+        context.objects.forEach(object => {
+          const objectReference = writtenObjects.get(object);
+          if (
+            objectReference !== undefined &&
+            (objectReference === reference ||
+              objectReference.indexOf(reference + ':') === 0)
+          ) {
+            writtenObjects.delete(object);
+          }
+        });
+        return partJSON;
+      }
+      // $FlowFixMe[incompatible-type] We know it's not null because we assigned it above.
+      const data: FormData = formData;
+      data.append(formFieldPrefix + id, partJSON);
+      return JSON.stringify(reference);
+    } finally {
+      streamItemContext = context.parent;
+      modelRoot = previousModelRoot;
+    }
   }
 
   function serializeReadableStream(stream: ReadableStream): string {
@@ -406,9 +467,7 @@ export function processReply(
           // Unlike streams, the last value may not be undefined. If it's not
           // we outline it and encode a reference to it in the closing instruction.
           try {
-            // $FlowFixMe[incompatible-type]: While plain JSON can return undefined we never do here.
-            const partJSON: string = JSON.stringify(entry.value, resolveToJSON);
-            data.append(streamPrefix, 'C' + partJSON); // Close signal
+            data.append(streamPrefix, 'C' + serializeStreamItem(entry.value)); // Close signal
           } catch (x) {
             reject(x);
             return;
@@ -420,9 +479,7 @@ export function processReply(
         }
       } else {
         try {
-          // $FlowFixMe[incompatible-type]: While plain JSON can return undefined we never do here.
-          const partJSON: string = JSON.stringify(entry.value, resolveToJSON);
-          data.append(streamPrefix, partJSON);
+          data.append(streamPrefix, serializeStreamItem(entry.value));
           iterator.next().then(progress, reject);
         } catch (x) {
           reject(x);
@@ -670,6 +727,16 @@ export function processReply(
         } else {
           // We've already emitted this as an outlined object, so we can
           // just refer to that by its existing ID.
+          // A synchronously settling iterator can refer to an item whose
+          // serialization is still on the stack.
+          let context = streamItemContext;
+          while (context !== null) {
+            if (context.objects.has(value)) {
+              context.referenced = true;
+              break;
+            }
+            context = context.parent;
+          }
           return existingReference;
         }
       } else if (key.indexOf(':') === -1) {
@@ -680,6 +747,9 @@ export function processReply(
           // through the property name inside that parent.
           const reference = parentReference + ':' + key;
           writtenObjects.set(value, reference);
+          if (streamItemContext !== null) {
+            streamItemContext.objects.add(value);
+          }
           if (temporaryReferences !== undefined) {
             // Store this object so that the server can refer to it later in responses.
             writeTemporaryReference(temporaryReferences, reference, value);
@@ -804,6 +874,11 @@ export function processReply(
         // $FlowFixMe[invalid-compare]
         if (iterator === value) {
           // Iterator, not Iterable
+          // Its contents are consumed once. Keep the containing item available
+          // so later occurrences can refer to this iterator through it.
+          if (streamItemContext !== null) {
+            streamItemContext.referenced = true;
+          }
           const iteratorId = nextPartId++;
           const partJSON = serializeModel(
             Array.from(iterator as any),
@@ -823,12 +898,21 @@ export function processReply(
         typeof ReadableStream === 'function' &&
         value instanceof ReadableStream
       ) {
+        // A stream is read once. If it is written inside a stream item, the
+        // item keeps its part, so that another place holding the stream can
+        // refer to it by a path through that part.
+        if (streamItemContext !== null) {
+          streamItemContext.referenced = true;
+        }
         return serializeReadableStream(value);
       }
       const getAsyncIterator: void | (() => $AsyncIterator<any, any, any>) = (
         value as any
       )[ASYNC_ITERATOR];
       if (typeof getAsyncIterator === 'function') {
+        if (streamItemContext !== null) {
+          streamItemContext.referenced = true;
+        }
         // We treat AsyncIterables as a Fragment and as such we might need to key them.
         return serializeAsyncIterable(
           value as any,
